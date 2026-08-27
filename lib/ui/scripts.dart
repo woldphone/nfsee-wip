@@ -1,628 +1,547 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:developer';
-import 'dart:math' as math;
 
-import 'package:flutter/cupertino.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-
-import 'package:flutter_nfc_kit/flutter_nfc_kit.dart';
-import 'package:nfsee/ui/custom_expansion_panel.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 import 'package:nfsee/data/blocs/bloc.dart';
 import 'package:nfsee/data/blocs/provider.dart';
 import 'package:nfsee/data/database/database.dart';
-import 'package:nfsee/models.dart';
+import 'package:nfsee/data/nfc_manager.dart';
+import 'package:nfsee/data/quickjs_engine.dart';
+import 'package:nfsee/data/script_examples.dart';
+import 'package:nfsee/l10n/app_localizations.dart';
 import 'package:nfsee/utilities.dart';
 
 class ScriptsAct extends StatefulWidget {
-  static const androidIcon = Icon(Icons.code);
-  static const iosIcon = Icon(Icons.code);
-
   final WebViewManager webview;
 
   ScriptsAct({required this.webview});
 
   @override
-  State<ScriptsAct> createState() => _ScriptsActState(webview: webview);
+  State<ScriptsAct> createState() => _ScriptsActState();
 }
 
 class _ScriptsActState extends State<ScriptsAct>
     with TickerProviderStateMixin, AutomaticKeepAliveClientMixin {
-  final WebViewManager webview;
-  StreamSubscription? _webViewListener;
+  final QuickJsScriptEngine _engine = QuickJsScriptEngine();
+  final NfcManager _nfcManager = NfcManager();
+  StreamSubscription<ScriptState>? _stateSubscription;
+  StreamSubscription<ScriptConsoleEntry>? _logSubscription;
 
   NFSeeAppBloc? get bloc => BlocProvider.provideBloc(context);
 
-  /// Result from webkit
-  Map<int, String> results = {};
+  /// Currently running script ID
+  int runningScriptId = -1;
+  ScriptState _engineState = ScriptState.ready;
+  final List<ScriptConsoleEntry> _consoleLogs = [];
 
-  /// Whether last run has error
-  Map<int, bool> errors = {};
-
-  /// Running script
-  int running = -1;
-
-  /// Last running script
-  /// Used to resolve a race between report and scriptEnd
-  int lastRunning = -1;
-
-  /// Id of current script
   var currentId = -1;
-
-  /// Name of current script
   var currentName = '';
-
-  /// Content of current script
   var currentSource = '';
 
   ScrollController? scroll;
-  late Animation<double> appbarFloat;
-  double appbarFloatVal = 0;
-  late AnimationController appbarFloatTrans;
-
-  late Animation<double> runningOpacity;
-  double runningOpacityVal = 0;
-  late AnimationController runningOpacityTrans;
-
-  _ScriptsActState({required this.webview});
 
   @override
   void initState() {
     super.initState();
-    _initSelf();
-  }
-
-  void _initSelf() {
-    _reloadWebviewListener();
-
-    appbarFloatTrans = AnimationController(
-        duration: const Duration(milliseconds: 100), vsync: this);
-
-    runningOpacityTrans = AnimationController(
-        duration: const Duration(milliseconds: 1000), vsync: this)
-      ..repeat(reverse: true, period: Duration(seconds: 1));
-
-    appbarFloat = Tween<double>(
-      begin: 0,
-      end: 1,
-    ).animate(CurvedAnimation(
-      parent: appbarFloatTrans,
-      curve: Curves.ease,
-    ));
-
-    appbarFloat.addListener(() {
-      setState(() {
-        appbarFloatVal = appbarFloat.value;
-      });
-    });
-
-    runningOpacity = Tween<double>(
-      begin: 0.3,
-      end: 1,
-    ).animate(CurvedAnimation(
-      parent: runningOpacityTrans,
-      curve: Curves.ease,
-    ));
-
-    runningOpacity.addListener(() {
-      setState(() {
-        runningOpacityVal = runningOpacity.value;
-      });
-    });
-
     scroll = ScrollController();
-    scroll!.addListener(() {
-      if (scroll!.position.pixels != 0) {
-        appbarFloatTrans.animateTo(1);
-      } else {
-        appbarFloatTrans.animateBack(0);
+
+    _stateSubscription = _engine.stateStream.listen((state) {
+      if (mounted) {
+        setState(() {
+          _engineState = state;
+          if (state == ScriptState.completed ||
+              state == ScriptState.failed ||
+              state == ScriptState.cancelled) {
+            runningScriptId = -1;
+          }
+        });
+      }
+    });
+
+    _logSubscription = _engine.logStream.listen((entry) {
+      if (mounted) {
+        setState(() {
+          _consoleLogs.add(entry);
+        });
       }
     });
   }
 
   @override
-  void reassemble() {
-    _initSelf();
-    super.reassemble();
-  }
-
-  void _reloadWebviewListener() {
-    _webViewListener?.cancel();
-
-    _webViewListener =
-        webview.stream(WebViewOwner.Script).listen(_onReceivedMessage);
-  }
-
-  @override
   void dispose() {
-    log("DISPOSE");
-    appbarFloatTrans.dispose();
-    runningOpacityTrans.dispose();
+    _stateSubscription?.cancel();
+    _logSubscription?.cancel();
+    _engine.dispose();
+    scroll?.dispose();
     super.dispose();
-  }
-
-  void _onReceivedMessage(WebViewEvent ev) async {
-    if (ev.reload) {
-      log("[Script] Reload detected");
-      // Reload
-      setState(() {
-        running = -1;
-        lastRunning = -1;
-      });
-
-      // With the new stream, we never need to reset listeners.
-      // log("Reset listener");
-      // this._reloadWebviewListener();
-      return;
-    }
-
-    assert(ev.message != null);
-    var scriptModel = ScriptDataModel.fromJson(json.decode(ev.message!));
-    log('[Script] Received action ${scriptModel.action} from script');
-    switch (scriptModel.action) {
-      case 'poll':
-        try {
-          final tag =
-              await FlutterNfcKit.poll(iosAlertMessage: S(context).waitForCard);
-          await webview.run("pollCallback(${jsonEncode(tag)})");
-          FlutterNfcKit.setIosAlertMessage(S(context).executingScript);
-        } on PlatformException catch (e) {
-          log('Poll exception: ${e.toDetailString()}');
-          await webview.run("pollErrorCallback(${e.toJsonString()})");
-        }
-        break;
-
-      case 'transceive':
-        try {
-          final rapdu = await FlutterNfcKit.transceive(scriptModel.data);
-          await webview.run("transceiveCallback('$rapdu')");
-        } on PlatformException catch (e) {
-          log('Transceive exception: ${e.toDetailString()}');
-          await webview.run("transceiveErrorCallback(${e.toJsonString()})");
-        }
-        break;
-
-      case 'error':
-        setState(() {
-          if (running != -1) {
-            errors[running] = true;
-          } else if (lastRunning != -1) {
-            errors[lastRunning] = true;
-          }
-        });
-        continue report;
-      report:
-      case 'report':
-        setState(() {
-          if (running != -1) {
-            results[running] = ('${scriptModel.data}\n') + results[running]!;
-          } else if (lastRunning != -1) {
-            results[lastRunning] =
-                ('${scriptModel.data}\n') + results[lastRunning]!;
-          }
-        });
-        break;
-
-      case 'finish':
-        if (errors[running] == true) {
-          await FlutterNfcKit.finish(iosErrorMessage: S(context).readFailed);
-        } else {
-          await FlutterNfcKit.finish(iosAlertMessage: S(context).readSucceeded);
-        }
-        log("Reseting running state");
-        setState(() {
-          lastRunning = running;
-          running = -1;
-        });
-        break;
-
-      case 'log':
-        log('Log from script: ${scriptModel.data.toString()}');
-        break;
-
-      default:
-        assert(false, 'Unknown action ${scriptModel.action}');
-        break;
-    }
   }
 
   void _runScript(SavedScript script) async {
     setState(() {
-      errors[script.id] = false;
-      results[script.id] = "";
-      running = script.id;
+      runningScriptId = script.id;
+      _consoleLogs.clear();
     });
 
-    log('[Script] Run script: ${script.source}');
+    await bloc?.updateScriptUseTime(script.id);
+
+    await _engine.executeScript(
+      scriptSource: script.source,
+      onPoll: () async {
+        final tag = await _nfcManager.pollForTag(
+          alertMessage: AppLocalizations.of(context)!.waitForCard,
+        );
+        return tag?.rawJson;
+      },
+      onTransceive: (capdu) async {
+        final res = await _nfcManager.transceiveApdu(capdu);
+        if (res.success) {
+          return res.responseApdu ?? '';
+        } else {
+          throw Exception(res.errorMessage);
+        }
+      },
+    );
 
     try {
-      final wrapped = "(async function() {${script.source}})()";
-      final encoded = json.encode(wrapped);
-      await webview.run('''
-          (async function() {
-            let source = $encoded;
-            await eval(source);
-          })().catch((e) => error(e.toString())).finally(finish);
-      ''');
-    } catch (e) {
-      log('[Script] Error: ${e as String}');
-    }
+      await _nfcManager.finishSession();
+    } catch (_) {}
+  }
+
+  void _stopScript() {
+    _engine.cancelExecution();
+  }
+
+  void _clearConsole() {
+    setState(() {
+      _consoleLogs.clear();
+    });
+  }
+
+  void _showExamplesModal() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) {
+        return Container(
+          height: MediaQuery.of(context).size.height * 0.75,
+          padding: EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    'Built-in Script Examples',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.close),
+                    onPressed: () => Navigator.of(ctx).pop(),
+                  ),
+                ],
+              ),
+              Divider(),
+              Expanded(
+                child: ListView.builder(
+                  itemCount: BuiltInScriptExamples.examples.length,
+                  itemBuilder: (c, idx) {
+                    final ex = BuiltInScriptExamples.examples[idx];
+                    return ListTile(
+                      title: Text(ex.title, style: TextStyle(fontWeight: FontWeight.w600)),
+                      subtitle: Text(ex.description),
+                      trailing: Icon(Icons.add_to_photos),
+                      onTap: () async {
+                        Navigator.of(ctx).pop();
+                        await bloc?.addScript(ex.title, ex.code);
+                        _showMessage(context, 'Added example to saved scripts!');
+                      },
+                    );
+                  },
+                ),
+              )
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _showScriptHelpDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: Text('NFCSee Scripting API Reference'),
+          content: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('Available Global Functions:', style: TextStyle(fontWeight: FontWeight.bold)),
+                SizedBox(height: 8),
+                Text('• await poll() : Scan NFC tag & return metadata JS object.'),
+                Text('• await transceive(hexCapdu) : Send APDU hex string, return response RAPDU.'),
+                Text('• print(...) / log(...) : Output informational messages.'),
+                Text('• warn(...) : Output warning messages.'),
+                Text('• error(...) : Output error messages.'),
+                Text('• hex(arrayOrString) : Convert byte array to formatted hex string.'),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: Text('Close'),
+            )
+          ],
+        );
+      },
+    );
   }
 
   void _showMessage(BuildContext context, String message) {
-    if (defaultTargetPlatform == TargetPlatform.android) {
-      var scaffoldMsg = ScaffoldMessenger.of(context);
-      scaffoldMsg.hideCurrentSnackBar();
-      scaffoldMsg.showSnackBar(SnackBar(
-        behavior: SnackBarBehavior.floating,
-        content: Text(message),
-        duration: Duration(seconds: 1),
-      ));
-    } else {
-      showCupertinoDialog(
-          context: context,
-          builder: (context) {
-            return CupertinoAlertDialog(
-              title: Text(message),
-              actions: <Widget>[
-                CupertinoButton(
-                  child: Text(MaterialLocalizations.of(context).okButtonLabel),
-                  onPressed: () {
-                    Navigator.of(context).pop();
-                  },
-                )
-              ],
-            );
-          });
-    }
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), duration: Duration(seconds: 2)),
+    );
   }
 
-  void _deleteScript(BuildContext context, SavedScript script) async {
-    // first hide the script
-    await bloc!.delScript(script.id);
-    log('Script ${script.name} deleted');
-    final message = '${S(context).script} ${script.name} ${S(context).deleted}';
+  Widget _buildStateBadge(ScriptState state) {
+    Color bg = Colors.grey;
+    String label = 'READY';
 
-    if (defaultTargetPlatform == TargetPlatform.android) {
-      var scaffoldMsg = ScaffoldMessenger.of(context);
-      scaffoldMsg.hideCurrentSnackBar();
-      scaffoldMsg
-          .showSnackBar(SnackBar(
-            behavior: SnackBarBehavior.floating,
-            content: Text(message),
-            duration: Duration(seconds: 5),
-            action: SnackBarAction(
-              label: S(context).undo,
-              onPressed: () {},
-            ),
-          ))
-          .closed
-          .then((reason) async {
-        switch (reason) {
-          case SnackBarClosedReason.action:
-            // user cancelled deletion
-            await bloc!
-                .addScript(script.name, script.source, script.creationTime);
-            log('Script ${script.name} restored');
-            break;
-          default:
-            break;
-        }
-      });
-    } else {
-      await bloc!.delScript(script.id);
-      showCupertinoDialog(
-          context: context,
-          builder: (context) {
-            return CupertinoAlertDialog(
-              title: Text(message),
-              actions: <Widget>[
-                CupertinoButton(
-                  child: Text(MaterialLocalizations.of(context).okButtonLabel),
-                  onPressed: () {
-                    Navigator.of(context).pop();
-                  },
-                )
-              ],
-            );
-          });
+    switch (state) {
+      case ScriptState.ready:
+        bg = Colors.blueGrey;
+        label = 'READY';
+        break;
+      case ScriptState.waitingForTag:
+        bg = Colors.orange;
+        label = 'WAITING FOR TAG';
+        break;
+      case ScriptState.tagAvailable:
+        bg = Colors.blue;
+        label = 'TAG AVAILABLE';
+        break;
+      case ScriptState.running:
+        bg = Colors.green;
+        label = 'RUNNING';
+        break;
+      case ScriptState.stopping:
+        bg = Colors.deepOrange;
+        label = 'STOPPING';
+        break;
+      case ScriptState.completed:
+        bg = Colors.teal;
+        label = 'COMPLETED';
+        break;
+      case ScriptState.failed:
+        bg = Colors.red;
+        label = 'FAILED';
+        break;
+      case ScriptState.cancelled:
+        bg = Colors.amber.shade800;
+        label = 'CANCELLED';
+        break;
+      case ScriptState.nfcDisabled:
+        bg = Colors.grey.shade800;
+        label = 'NFC DISABLED';
+        break;
     }
+
+    return Container(
+      padding: EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold),
+      ),
+    );
+  }
+
+  Widget _buildConsoleOutput() {
+    return Container(
+      height: 180,
+      width: double.infinity,
+      padding: EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Colors.black87,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'LIVE SCRIPT CONSOLE',
+                style: TextStyle(color: Colors.greenAccent, fontSize: 11, fontWeight: FontWeight.bold),
+              ),
+              Row(
+                children: [
+                  _buildStateBadge(_engineState),
+                  SizedBox(width: 8),
+                  GestureDetector(
+                    onTap: _clearConsole,
+                    child: Icon(Icons.clear_all, color: Colors.white70, size: 18),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          Divider(color: Colors.white24, height: 12),
+          Expanded(
+            child: _consoleLogs.isEmpty
+                ? Center(
+                    child: Text(
+                      'Console logs will appear here during execution...',
+                      style: TextStyle(color: Colors.white38, fontSize: 12),
+                    ),
+                  )
+                : ListView.builder(
+                    itemCount: _consoleLogs.length,
+                    itemBuilder: (c, idx) {
+                      final logEntry = _consoleLogs[idx];
+                      Color textColor = Colors.white;
+                      if (logEntry.level == 'ERROR') textColor = Colors.redAccent;
+                      if (logEntry.level == 'WARN') textColor = Colors.amberAccent;
+                      if (logEntry.level == 'INFO') textColor = Colors.greenAccent;
+
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 2.0),
+                        child: Text(
+                          logEntry.format(),
+                          style: TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 12,
+                            color: textColor,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _buildBody(BuildContext context) {
-    return Container(
-        child: StreamBuilder<List<SavedScript>>(
+    return StreamBuilder<List<SavedScript>>(
       stream: bloc!.savedScripts,
       builder: (context, snapshot) {
-        if (!snapshot.hasData || snapshot.data!.isEmpty) {
-          return Container(
-              width: double.infinity,
-              height: double.infinity,
-              child: Column(
-                mainAxisSize: MainAxisSize.max,
-                mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: <Widget>[
-                  Image.asset('assets/empty.png', height: 200),
-                  Text(S(context).noScriptFound),
-                ],
-              ));
-        }
-        // filter only visible scripts
-        final scripts = snapshot.data!.toList()
-          ..sort((a, b) => a.creationTime.compareTo(b.creationTime));
+        final scripts = snapshot.data ?? [];
 
         return SingleChildScrollView(
-            padding: EdgeInsets.only(bottom: 40, top: 120),
-            controller: scroll,
-            child: NFSeeExpansionPanelList.radio(
-              elevation: 1,
-              children: scripts
-                  .map((script) => NFSeeExpansionPanelRadio(
-                        running: running == script.id,
-                        value: script.id,
-                        canTapOnHeader: true,
-                        headerBuilder: (context, open) => Opacity(
-                          child: ListTile(
-                            subtitle: Text(
-                                '${S(context).lastExecutionTime}: ${script.lastUsed != null ? script.lastUsed.toString().split('.')[0] // remove part before ms
-                                    : S(context).never}'),
-                            title: Text(script.name),
-                          ),
-                          opacity: running == script.id ? runningOpacityVal : 1,
-                        ),
-                        body: Container(
-                          padding: EdgeInsets.only(
-                            bottom: 10,
-                            left: 20,
-                            right: 20,
-                          ),
-                          child: Column(
-                            children: <Widget>[
-                              _getScriptResult(context, script),
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.end,
-                                children: <Widget>[
+          padding: EdgeInsets.only(bottom: 40, top: 100, left: 16, right: 16),
+          controller: scroll,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _buildConsoleOutput(),
+              SizedBox(height: 16),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    'Saved Scripts (${scripts.length})',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                  ElevatedButton.icon(
+                    onPressed: _showExamplesModal,
+                    icon: Icon(Icons.library_books, size: 16),
+                    label: Text('Examples'),
+                    style: ElevatedButton.styleFrom(
+                      padding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    ),
+                  ),
+                ],
+              ),
+              SizedBox(height: 10),
+              if (scripts.isEmpty)
+                Container(
+                  padding: EdgeInsets.all(30),
+                  width: double.infinity,
+                  child: Column(
+                    children: [
+                      Image.asset('assets/empty.png', height: 120),
+                      SizedBox(height: 10),
+                      Text('No custom scripts found. Click + or Examples to start!'),
+                    ],
+                  ),
+                )
+              else
+                ListView.builder(
+                  shrinkWrap: true,
+                  physics: NeverScrollableScrollPhysics(),
+                  itemCount: scripts.length,
+                  itemBuilder: (c, idx) {
+                    final script = scripts[idx];
+                    final isThisRunning = runningScriptId == script.id;
+
+                    return Card(
+                      margin: EdgeInsets.only(bottom: 12),
+                      child: Padding(
+                        padding: EdgeInsets.all(12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              script.name,
+                              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                            ),
+                            SizedBox(height: 4),
+                            Text(
+                              'Source Code (${script.source.length} chars)',
+                              style: TextStyle(color: Colors.grey, fontSize: 12),
+                            ),
+                            SizedBox(height: 8),
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.end,
+                              children: [
+                                if (isThisRunning &&
+                                    (_engineState == ScriptState.running ||
+                                        _engineState == ScriptState.waitingForTag))
                                   TextButton.icon(
-                                      // Disable run button if there is a script running in background
-                                      onPressed: running == -1
-                                          ? () async {
-                                              _runScript(script);
-                                              await bloc!.updateScriptUseTime(
-                                                  script.id);
-                                            }
-                                          : null,
-                                      style: TextButton.styleFrom(
-                                          foregroundColor: Theme.of(context)
-                                              .colorScheme
-                                              .primary),
-                                      // icon:
-                                      icon: running == script.id
-                                          ? Padding(
-                                              padding: EdgeInsets.all(4),
-                                              child: SizedBox(
-                                                width: 16,
-                                                height: 16,
-                                                child:
-                                                    CircularProgressIndicator(
-                                                  strokeWidth: 2,
-                                                  valueColor:
-                                                      AlwaysStoppedAnimation(
-                                                    Theme.of(context)
-                                                        .disabledColor,
-                                                  ),
-                                                ),
-                                              ))
-                                          : Icon(Icons.play_arrow),
-                                      label: Text(S(context).run)),
-                                  Expanded(child: Container()),
-                                  IconButton(
-                                    onPressed: () {
-                                      _showScriptDialog(script);
-                                    },
-                                    color:
-                                        Theme.of(context).colorScheme.onSurface,
-                                    icon: Icon(Icons.edit),
-                                    tooltip: S(context).edit,
+                                    onPressed: _stopScript,
+                                    icon: Icon(Icons.stop, color: Colors.red),
+                                    label: Text('STOP', style: TextStyle(color: Colors.red)),
+                                  )
+                                else
+                                  TextButton.icon(
+                                    onPressed: runningScriptId == -1
+                                        ? () => _runScript(script)
+                                        : null,
+                                    icon: Icon(Icons.play_arrow),
+                                    label: Text('RUN'),
                                   ),
-                                  IconButton(
-                                    onPressed: () async =>
-                                        _deleteScript(context, script),
-                                    color:
-                                        Theme.of(context).colorScheme.onSurface,
-                                    icon: Icon(Icons.delete),
-                                    tooltip: S(context).delete,
-                                  ),
-                                  IconButton(
-                                      onPressed: () async {
-                                        await Clipboard.setData(
-                                            ClipboardData(text: script.source));
-                                        _showMessage(context,
-                                            '${S(context).script} ${script.name} ${S(context).copied}');
-                                      },
-                                      color: Theme.of(context)
-                                          .colorScheme
-                                          .onSurface,
-                                      icon: Icon(Icons.content_copy),
-                                      tooltip: S(context).copy),
-                                ],
-                              ),
-                            ],
-                          ),
+                                IconButton(
+                                  icon: Icon(Icons.edit, size: 20),
+                                  onPressed: () => _showScriptDialog(script),
+                                ),
+                                IconButton(
+                                  icon: Icon(Icons.copy, size: 20),
+                                  onPressed: () async {
+                                    await Clipboard.setData(ClipboardData(text: script.source));
+                                    _showMessage(context, 'Script code copied!');
+                                  },
+                                ),
+                                IconButton(
+                                  icon: Icon(Icons.delete, size: 20, color: Colors.red),
+                                  onPressed: () async {
+                                    await bloc!.delScript(script.id);
+                                    _showMessage(context, 'Script deleted.');
+                                  },
+                                ),
+                              ],
+                            )
+                          ],
                         ),
-                      ))
-                  .toList(),
-            ));
+                      ),
+                    );
+                  },
+                ),
+            ],
+          ),
+        );
       },
-    ));
+    );
   }
 
   void _addOrModifyScript() async {
-    if (currentSource == '') {
-      return;
-    }
-    if (currentId == -1) {
-      log("Adding script: $currentName");
+    if (currentSource.trim().isEmpty) return;
 
-      await bloc!
-          .addScript(currentName == '' ? 'Script' : currentName, currentSource);
+    if (currentId == -1) {
+      await bloc!.addScript(currentName.isEmpty ? 'New Script' : currentName, currentSource);
     } else {
-      log("Modifying script: $currentName");
-      await bloc!.updateScriptContent(
-          currentId, currentName == '' ? 'Script' : currentName, currentSource);
+      await bloc!.updateScriptContent(currentId, currentName.isEmpty ? 'Script' : currentName, currentSource);
     }
 
     currentId = -1;
     currentName = '';
     currentSource = '';
-
-    // Close alert dialog
     Navigator.of(context, rootNavigator: true).pop();
   }
 
-  Widget _buildAddScriptDialogContent() {
-    return SingleChildScrollView(
-        child: ListBody(children: <Widget>[
-      TextFormField(
-        initialValue: currentName,
-        decoration: InputDecoration(
-          border: OutlineInputBorder(),
-          hintText: S(context).name,
-        ),
-        maxLines: 1,
-        onChanged: (cont) {
-          currentName = cont;
-        },
-      ),
-      SizedBox(height: 10),
-      TextFormField(
-        initialValue: currentSource,
-        decoration: InputDecoration(
-            border: OutlineInputBorder(), hintText: S(context).code),
-        minLines: 3,
-        maxLines: null,
-        onChanged: (cont) {
-          currentSource = cont;
-        },
-      )
-    ]));
-  }
-
   void _showScriptDialog([SavedScript? script]) {
-    var id = script?.id ?? -1;
-    var name = script?.name ?? '';
-    var source = script?.source ?? '';
-
-    // These variables are not used in rendering, so we don't need to setState here
-    currentId = id;
-    currentSource = source;
-    currentName = name;
+    currentId = script?.id ?? -1;
+    currentName = script?.name ?? '';
+    currentSource = script?.source ?? '';
 
     showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) {
-          return AlertDialog(
-            title:
-                Text(id == -1 ? S(context).addScript : S(context).modifyScript),
-            content: _buildAddScriptDialogContent(),
-            actions: <Widget>[
-              TextButton(
-                child:
-                    Text(MaterialLocalizations.of(context).cancelButtonLabel),
-                onPressed: () {
-                  Navigator.of(context, rootNavigator: true).pop();
-                },
-              ),
-              TextButton(
-                child: Text(MaterialLocalizations.of(context).okButtonLabel),
-                onPressed: _addOrModifyScript,
-              ),
-            ],
-          );
-        });
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return AlertDialog(
+          title: Text(currentId == -1 ? 'Add Script' : 'Edit Script'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextFormField(
+                  initialValue: currentName,
+                  decoration: InputDecoration(
+                    border: OutlineInputBorder(),
+                    hintText: 'Script Name',
+                  ),
+                  onChanged: (v) => currentName = v,
+                ),
+                SizedBox(height: 12),
+                TextFormField(
+                  initialValue: currentSource,
+                  decoration: InputDecoration(
+                    border: OutlineInputBorder(),
+                    hintText: '// Write JavaScript NFC script here...',
+                  ),
+                  style: TextStyle(fontFamily: 'monospace', fontSize: 13),
+                  minLines: 6,
+                  maxLines: 12,
+                  onChanged: (v) => currentSource = v,
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: _addOrModifyScript,
+              child: Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     super.build(context);
-    final title = Transform.translate(
-        offset: Offset(0, 20 * (1 - appbarFloatVal)),
-        child: AppBar(
-            elevation: math.max((appbarFloatVal - 0.8) / 0.2 * 4, 0),
-            backgroundColor:
-                Theme.of(context).primaryColor.withOpacity(appbarFloatVal),
-            title: Text(
-              S(context).scriptTabTitle,
-              style: Theme.of(context).primaryTextTheme.titleLarge!.copyWith(
-                    fontSize: 20 + 12 * (1 - appbarFloatVal),
-                  ),
-            ),
-            actions: [
-              IconButton(
-                icon: Icon(Icons.add,
-                    color: Theme.of(context)
-                        .primaryTextTheme
-                        .headlineSmall!
-                        .color),
-                onPressed: _showScriptDialog,
-                tooltip: S(context).addScript,
-              ),
-              IconButton(
-                icon: Icon(Icons.help,
-                    color: Theme.of(context)
-                        .primaryTextTheme
-                        .headlineSmall!
-                        .color),
-                tooltip: S(context).help,
-                onPressed: () {
-                  launchUrl(Uri.parse('https://nfsee.nfc.im/js-extension/'));
-                },
-              ),
-            ]));
-
-    return Stack(
-      children: <Widget>[
-        Builder(builder: _buildBody),
-        Column(children: [
-          PreferredSize(child: title, preferredSize: Size.fromHeight(56))
-        ]),
-      ],
-    );
-  }
-
-  Widget _getScriptResult(BuildContext context, SavedScript script) {
-    final result = results[script.id];
-    final error = errors[script.id];
-
-    if (result != null && result != "") {
-      return Container(
-        width: double.infinity,
-        padding: EdgeInsets.all(20),
-        margin: EdgeInsets.only(bottom: 10),
-        color: Color.fromARGB(10, 0, 0, 0),
-        child: SelectableText(
-          result,
-          style: TextStyle(
-              color: error!
-                  ? Colors.red
-                  : Theme.of(context).colorScheme.onSurface),
-        ),
-      );
-    }
-
-    return Container(
-      padding: EdgeInsets.all(20),
-      margin: EdgeInsets.only(bottom: 10),
-      child: Center(
-          child: Text(
-        S(context).pressRun,
-        style: TextStyle(color: Theme.of(context).disabledColor),
-      )),
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('NFCSee Scripting Workspace'),
+        actions: [
+          IconButton(
+            icon: Icon(Icons.add),
+            onPressed: () => _showScriptDialog(),
+            tooltip: 'Add Script',
+          ),
+          IconButton(
+            icon: Icon(Icons.help_outline),
+            onPressed: _showScriptHelpDialog,
+            tooltip: 'API Help',
+          ),
+        ],
+      ),
+      body: _buildBody(context),
     );
   }
 

@@ -17,7 +17,7 @@ import 'package:nfsee/ui/settings.dart';
 import 'package:nfsee/utilities.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
-import 'package:flutter_gen/gen_l10n/app_localizations.dart';
+import 'package:nfsee/l10n/app_localizations.dart';
 
 void main() => runApp(NFSeeApp());
 
@@ -145,87 +145,85 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
 
   void _onReceivedMessage(WebViewEvent ev) async {
     if (ev.reload) return; // Main doesn't care about reload events
-    assert(ev.message != null);
+    if (ev.message == null) return;
 
-    var scriptModel = ScriptDataModel.fromJson(json.decode(ev.message!));
-    log('[Main] Received action ${scriptModel.action} from script');
-    switch (scriptModel.action) {
-      case 'poll':
-        error = null;
-        try {
-          final tag =
-              await FlutterNfcKit.poll(iosAlertMessage: S(context).waitForCard);
-          final json = tag.toJson();
-
-          // try to read ndef and insert into json
-          try {
-            final ndef = await FlutterNfcKit.readNDEFRawRecords();
-            json["ndef"] = ndef;
-          } on PlatformException catch (e) {
-            // allow readNDEF to fail
-            json["ndef"] = null;
-            log('Silent readNDEF error: ${e.toDetailString()}');
-          }
-
-          await webview.run("pollCallback(${jsonEncode(json)})");
-          FlutterNfcKit.setIosAlertMessage(S(context).cardPolled);
-        } on PlatformException catch (e) {
-          error = e;
-          // no need to do anything with FlutterNfcKit, which will reset itself
-          log('Poll error: ${e.toDetailString()}');
-          _closeReadModal(context);
-          showSnackbar(SnackBar(
-              content:
-                  Text('${S(context).readFailed}: ${e.toDetailString()}')));
-          // reject the promise
-          await webview.run("pollErrorCallback(${e.toJsonString()})");
-        }
-        break;
-
-      case 'transceive':
-        try {
-          log('TX: ${scriptModel.data}');
-          final rapdu =
-              await FlutterNfcKit.transceive(scriptModel.data as String);
-          log('RX: $rapdu');
-          await webview.run("transceiveCallback('$rapdu')");
-        } on PlatformException catch (e) {
-          error = e;
-          // we need to explicitly finish the reader session now **in the script** to stop any following operations,
-          // otherwise a following poll might crash the entire application,
-          // because ReaderMode is still enabled, and the obselete MethodChannel.Result will be re-used.
-          log('Transceive error: ${e.toDetailString()}');
-          _closeReadModal(context);
-          showSnackbar(SnackBar(
-              content:
-                  Text('${S(context).readFailed}: ${e.toDetailString()}')));
-          await webview.run("transceiveErrorCallback(${e.toJsonString()})");
-        }
-        break;
-
-      case 'report':
-        _closeReadModal(context);
-        /* final id = */ await bloc
-            .addDumpedRecord(jsonEncode(scriptModel.data));
-        home.scrollToNewCard();
-        break;
-
-      case 'finish':
-        if (error != null) {
-          await FlutterNfcKit.finish(iosErrorMessage: S(context).readFailed);
+    try {
+      var scriptModel = ScriptDataModel.fromJson(json.decode(ev.message!));
+      log('[Main] Received action ${scriptModel.action} from script');
+      switch (scriptModel.action) {
+        case 'poll':
           error = null;
-        } else {
-          await FlutterNfcKit.finish(iosAlertMessage: S(context).readSucceeded);
-        }
-        break;
+          try {
+            final tag =
+                await FlutterNfcKit.poll(iosAlertMessage: S(context).waitForCard);
+            final json = tag.toJson();
 
-      case 'log':
-        log('Log from script: ${scriptModel.data.toString()}');
-        break;
+            try {
+              final ndef = await FlutterNfcKit.readNDEFRawRecords();
+              json["ndef"] = ndef;
+            } on Exception catch (e) {
+              json["ndef"] = null;
+              log('Silent readNDEF error: $e');
+            }
 
-      default:
-        assert(false, 'Unknown action ${scriptModel.action}');
-        break;
+            await webview.run("pollCallback(${jsonEncode(json)})");
+            FlutterNfcKit.setIosAlertMessage(S(context).cardPolled);
+          } on Exception catch (e) {
+            error = e;
+            log('Poll error: $e');
+            _closeReadModal(context);
+            showSnackbar(SnackBar(
+                content: Text('${S(context).readFailed}: $e')));
+            await webview.run("pollErrorCallback('${e.toString()}')");
+          }
+          break;
+
+        case 'transceive':
+          try {
+            log('TX: ${scriptModel.data}');
+            final rapdu =
+                await FlutterNfcKit.transceive(scriptModel.data as String);
+            log('RX: $rapdu');
+            await webview.run("transceiveCallback('$rapdu')");
+          } on Exception catch (e) {
+            error = e;
+            log('Transceive error: $e');
+            _closeReadModal(context);
+            showSnackbar(SnackBar(
+                content: Text('${S(context).readFailed}: $e')));
+            await webview.run("transceiveErrorCallback('${e.toString()}')");
+          }
+          break;
+
+        case 'report':
+          _closeReadModal(context);
+          await bloc.addDumpedRecord(jsonEncode(scriptModel.data));
+          home.scrollToNewCard();
+          break;
+
+        case 'finish':
+          try {
+            if (error != null) {
+              await FlutterNfcKit.finish(iosErrorMessage: S(context).readFailed);
+              error = null;
+            } else {
+              await FlutterNfcKit.finish(iosAlertMessage: S(context).readSucceeded);
+            }
+          } catch (e) {
+            log('Finish error caught: $e');
+          }
+          break;
+
+        case 'log':
+          log('Log from script: ${scriptModel.data.toString()}');
+          break;
+
+        default:
+          log('Unknown action ${scriptModel.action}');
+          break;
+      }
+    } catch (e) {
+      log('Webview message parse exception caught: $e');
     }
   }
 
@@ -324,7 +322,6 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
     // Reload before read to ensure an clear state
     await webview.reload();
     await webview.run(script);
-    // this._mockRead();
 
     bool cardRead = true;
     if ((await modal) != true) {
