@@ -322,7 +322,6 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
     // Reload before read to ensure an clear state
     await webview.reload();
     await webview.run(script);
-    // this._mockRead();
 
     bool cardRead = true;
     if ((await modal) != true) {
