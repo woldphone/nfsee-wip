@@ -7,9 +7,9 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
-import 'package:flutter_nfc_kit/flutter_nfc_kit.dart';
 import 'package:nfsee/data/blocs/bloc.dart';
 import 'package:nfsee/data/blocs/provider.dart';
+import 'package:nfsee/data/nfc_manager.dart';
 import 'package:nfsee/models.dart';
 import 'package:nfsee/ui/home.dart';
 import 'package:nfsee/ui/scripts.dart';
@@ -17,7 +17,7 @@ import 'package:nfsee/ui/settings.dart';
 import 'package:nfsee/utilities.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
-import 'package:flutter_gen/gen_l10n/app_localizations.dart';
+import 'package:nfsee/l10n/app_localizations.dart';
 
 void main() => runApp(NFSeeApp());
 
@@ -39,8 +39,6 @@ class _NFSeeAppState extends State<NFSeeApp> {
   Widget build(context) {
     return BlocProvider(
       bloc: bloc,
-      // Either Material or Cupertino widgets work in either Material or Cupertino
-      // Apps.
       child: MaterialApp(
         debugShowCheckedModeBanner: false,
         localizationsDelegates: [
@@ -80,13 +78,6 @@ class _NFSeeAppState extends State<NFSeeApp> {
   }
 }
 
-// Shows a different type of scaffold depending on the platform.
-//
-// This file has the most amount of non-sharable code since it behaves the most
-// differently between the platforms.
-//
-// These differences are also subjective and have more than one 'right' answer
-// depending on the app and content.
 class PlatformAdaptingHomePage extends StatefulWidget {
   @override
   State<PlatformAdaptingHomePage> createState() =>
@@ -99,6 +90,7 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
   Exception? error;
   final GlobalKey<ScaffoldMessengerState> _scaffoldMessengerKey =
       GlobalKey<ScaffoldMessengerState>();
+  final NfcManager _nfcManager = NfcManager();
 
   PageController? topController;
   WebViewManager webview = WebViewManager();
@@ -125,8 +117,6 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
     topController = PageController(
       initialPage: currentTop,
     );
-    // Webview should reload when it's initialized. So we don't need to call reload here
-    // webview.reload();
   }
 
   @override
@@ -144,88 +134,87 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
   }
 
   void _onReceivedMessage(WebViewEvent ev) async {
-    if (ev.reload) return; // Main doesn't care about reload events
-    assert(ev.message != null);
+    if (ev.reload) return;
+    if (ev.message == null) return;
 
-    var scriptModel = ScriptDataModel.fromJson(json.decode(ev.message!));
-    log('[Main] Received action ${scriptModel.action} from script');
-    switch (scriptModel.action) {
-      case 'poll':
-        error = null;
-        try {
-          final tag =
-              await FlutterNfcKit.poll(iosAlertMessage: S(context).waitForCard);
-          final json = tag.toJson();
-
-          // try to read ndef and insert into json
-          try {
-            final ndef = await FlutterNfcKit.readNDEFRawRecords();
-            json["ndef"] = ndef;
-          } on PlatformException catch (e) {
-            // allow readNDEF to fail
-            json["ndef"] = null;
-            log('Silent readNDEF error: ${e.toDetailString()}');
-          }
-
-          await webview.run("pollCallback(${jsonEncode(json)})");
-          FlutterNfcKit.setIosAlertMessage(S(context).cardPolled);
-        } on PlatformException catch (e) {
-          error = e;
-          // no need to do anything with FlutterNfcKit, which will reset itself
-          log('Poll error: ${e.toDetailString()}');
-          _closeReadModal(context);
-          showSnackbar(SnackBar(
-              content:
-                  Text('${S(context).readFailed}: ${e.toDetailString()}')));
-          // reject the promise
-          await webview.run("pollErrorCallback(${e.toJsonString()})");
-        }
-        break;
-
-      case 'transceive':
-        try {
-          log('TX: ${scriptModel.data}');
-          final rapdu =
-              await FlutterNfcKit.transceive(scriptModel.data as String);
-          log('RX: $rapdu');
-          await webview.run("transceiveCallback('$rapdu')");
-        } on PlatformException catch (e) {
-          error = e;
-          // we need to explicitly finish the reader session now **in the script** to stop any following operations,
-          // otherwise a following poll might crash the entire application,
-          // because ReaderMode is still enabled, and the obselete MethodChannel.Result will be re-used.
-          log('Transceive error: ${e.toDetailString()}');
-          _closeReadModal(context);
-          showSnackbar(SnackBar(
-              content:
-                  Text('${S(context).readFailed}: ${e.toDetailString()}')));
-          await webview.run("transceiveErrorCallback(${e.toJsonString()})");
-        }
-        break;
-
-      case 'report':
-        _closeReadModal(context);
-        /* final id = */ await bloc
-            .addDumpedRecord(jsonEncode(scriptModel.data));
-        home.scrollToNewCard();
-        break;
-
-      case 'finish':
-        if (error != null) {
-          await FlutterNfcKit.finish(iosErrorMessage: S(context).readFailed);
+    try {
+      var scriptModel = ScriptDataModel.fromJson(json.decode(ev.message!));
+      log('[Main] Received action ${scriptModel.action} from script');
+      switch (scriptModel.action) {
+        case 'poll':
           error = null;
-        } else {
-          await FlutterNfcKit.finish(iosAlertMessage: S(context).readSucceeded);
-        }
-        break;
+          try {
+            final tag = await _nfcManager.pollForTag(
+                alertMessage: S(context).waitForCard);
+            final json = tag?.rawJson ?? {};
 
-      case 'log':
-        log('Log from script: ${scriptModel.data.toString()}');
-        break;
+            try {
+              final ndef = await _nfcManager.readNdefRawRecords();
+              json["ndef"] = ndef;
+            } on Exception catch (e) {
+              json["ndef"] = null;
+              log('Silent readNDEF error: $e');
+            }
 
-      default:
-        assert(false, 'Unknown action ${scriptModel.action}');
-        break;
+            await webview.run("pollCallback(${jsonEncode(json)})");
+          } on Exception catch (e) {
+            error = e;
+            log('Poll error: $e');
+            _closeReadModal(context);
+            showSnackbar(SnackBar(
+                content: Text('${S(context).readFailed}: $e')));
+            await webview.run("pollErrorCallback('${e.toString()}')");
+          }
+          break;
+
+        case 'transceive':
+          try {
+            log('TX: ${scriptModel.data}');
+            final res = await _nfcManager.transceiveApdu(scriptModel.data as String);
+            if (res.success) {
+              log('RX: ${res.responseApdu}');
+              await webview.run("transceiveCallback('${res.responseApdu}')");
+            } else {
+              throw Exception(res.errorMessage);
+            }
+          } on Exception catch (e) {
+            error = e;
+            log('Transceive error: $e');
+            _closeReadModal(context);
+            showSnackbar(SnackBar(
+                content: Text('${S(context).readFailed}: $e')));
+            await webview.run("transceiveErrorCallback('${e.toString()}')");
+          }
+          break;
+
+        case 'report':
+          _closeReadModal(context);
+          await bloc.addDumpedRecord(jsonEncode(scriptModel.data));
+          home.scrollToNewCard();
+          break;
+
+        case 'finish':
+          try {
+            await _nfcManager.finishSession(
+              errorMessage: error != null ? S(context).readFailed : null,
+              alertMessage: error == null ? S(context).readSucceeded : null,
+            );
+            error = null;
+          } catch (e) {
+            log('Finish error caught: $e');
+          }
+          break;
+
+        case 'log':
+          log('Log from script: ${scriptModel.data.toString()}');
+          break;
+
+        default:
+          log('Unknown action ${scriptModel.action}');
+          break;
+      }
+    } catch (e) {
+      log('Webview message parse exception caught: $e');
     }
   }
 
@@ -306,7 +295,6 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
   }
 
   Future<bool> _readTag(BuildContext context) async {
-    // Because we are launching an modal bottom sheet, user should not be able to intereact with the app anymore
     assert(!_reading);
 
     _reading = true;
@@ -321,14 +309,11 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
     }
 
     final script = await rootBundle.loadString('assets/read.js');
-    // Reload before read to ensure an clear state
     await webview.reload();
     await webview.run(script);
-    // this._mockRead();
 
     bool cardRead = true;
     if ((await modal) != true) {
-      // closed by user, reject the promise
       await webview.run("pollErrorCallback('User cancelled operation')");
       cardRead = false;
     }
