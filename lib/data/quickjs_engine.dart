@@ -118,26 +118,71 @@ class QuickJsScriptEngine {
       }
     });
 
-    _runtime!.onMessage('nfcPoll', (dynamic args) async {
-      if (_cancelRequested) throw Exception('Script cancelled');
+    _runtime!.onMessage('nfcPollReq', (dynamic args) async {
+      final reqId = args['reqId']?.toString();
+      if (reqId == null) return;
+      if (_cancelRequested) {
+        _runtime?.evaluate('__resolveNfcReq("$reqId", false, "Script cancelled");');
+        return;
+      }
+
       _setState(ScriptState.waitingForTag);
-      final tagData = await onPoll();
-      if (_cancelRequested) throw Exception('Script cancelled');
-      _setState(ScriptState.tagAvailable);
-      return jsonEncode(tagData ?? {});
+      try {
+        final tagData = await onPoll();
+        if (_cancelRequested) {
+          _runtime?.evaluate('__resolveNfcReq("$reqId", false, "Script cancelled");');
+          return;
+        }
+        _setState(ScriptState.tagAvailable);
+        final encoded = jsonEncode(tagData ?? {});
+        final escaped = jsonEncode(encoded);
+        _runtime?.evaluate('__resolveNfcReq("$reqId", true, $escaped);');
+      } catch (e) {
+        final escapedErr = jsonEncode(e.toString());
+        _runtime?.evaluate('__resolveNfcReq("$reqId", false, $escapedErr);');
+      }
     });
 
-    _runtime!.onMessage('nfcTransceive', (dynamic args) async {
-      if (_cancelRequested) throw Exception('Script cancelled');
+    _runtime!.onMessage('nfcTransceiveReq', (dynamic args) async {
+      final reqId = args['reqId']?.toString();
       final capdu = args['capdu']?.toString() ?? '';
-      final rapdu = await onTransceive(capdu);
-      if (_cancelRequested) throw Exception('Script cancelled');
-      return rapdu;
+      if (reqId == null) return;
+
+      if (_cancelRequested) {
+        _runtime?.evaluate('__resolveNfcReq("$reqId", false, "Script cancelled");');
+        return;
+      }
+
+      try {
+        final rapdu = await onTransceive(capdu);
+        if (_cancelRequested) {
+          _runtime?.evaluate('__resolveNfcReq("$reqId", false, "Script cancelled");');
+          return;
+        }
+        final escapedRapdu = jsonEncode(rapdu);
+        _runtime?.evaluate('__resolveNfcReq("$reqId", true, $escapedRapdu);');
+      } catch (e) {
+        final escapedErr = jsonEncode(e.toString());
+        _runtime?.evaluate('__resolveNfcReq("$reqId", false, $escapedErr);');
+      }
     });
 
-    // Helper JS setup including poll and transceive bindings
+    // Preamble with bidirectional Promise callback bridge
     const jsPreamble = '''
       var tag = null;
+      var __nfcCallbacks = {};
+      var __nfcReqCounter = 0;
+
+      function __resolveNfcReq(reqId, success, result) {
+        if (__nfcCallbacks[reqId]) {
+          if (success) {
+            __nfcCallbacks[reqId].resolve(result);
+          } else {
+            __nfcCallbacks[reqId].reject(new Error(result));
+          }
+          delete __nfcCallbacks[reqId];
+        }
+      }
 
       function print() {
         var msg = Array.prototype.slice.call(arguments).join(' ');
@@ -169,22 +214,36 @@ class QuickJsScriptEngine {
         return String(bytes);
       }
 
-      async function poll() {
+      function poll() {
         sendMessage('scriptState', JSON.stringify({state: 'WAITING_FOR_TAG'}));
-        var res = await sendMessage('nfcPoll', JSON.stringify({}));
-        try {
-          var data = typeof res === 'string' ? JSON.parse(res) : res;
-          tag = data;
-          sendMessage('scriptState', JSON.stringify({state: 'TAG_AVAILABLE'}));
-          return data;
-        } catch(e) {
-          return null;
-        }
+        return new Promise(function(resolve, reject) {
+          var reqId = 'poll_' + (++__nfcReqCounter);
+          __nfcCallbacks[reqId] = {
+            resolve: function(dataStr) {
+              try {
+                var data = typeof dataStr === 'string' ? JSON.parse(dataStr) : dataStr;
+                tag = data;
+                sendMessage('scriptState', JSON.stringify({state: 'TAG_AVAILABLE'}));
+                resolve(data);
+              } catch(e) {
+                resolve(null);
+              }
+            },
+            reject: reject
+          };
+          sendMessage('nfcPollReq', JSON.stringify({reqId: reqId}));
+        });
       }
 
-      async function transceive(capdu) {
-        var res = await sendMessage('nfcTransceive', JSON.stringify({capdu: capdu}));
-        return res;
+      function transceive(capdu) {
+        return new Promise(function(resolve, reject) {
+          var reqId = 'tx_' + (++__nfcReqCounter);
+          __nfcCallbacks[reqId] = {
+            resolve: resolve,
+            reject: reject
+          };
+          sendMessage('nfcTransceiveReq', JSON.stringify({reqId: reqId, capdu: capdu}));
+        });
       }
     ''';
 
@@ -214,8 +273,10 @@ class QuickJsScriptEngine {
       _appendLog('INFO', 'Script execution started.');
       final evalResult = _runtime!.evaluate(wrappedUserScript);
 
-      if (evalResult.isError) {
-        throw Exception(evalResult.stringResult);
+      final promiseResult = await _runtime!.handlePromise(evalResult);
+
+      if (promiseResult.isError) {
+        throw Exception(promiseResult.stringResult);
       }
 
       if (_cancelRequested) {

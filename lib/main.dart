@@ -7,9 +7,9 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
-import 'package:flutter_nfc_kit/flutter_nfc_kit.dart';
 import 'package:nfsee/data/blocs/bloc.dart';
 import 'package:nfsee/data/blocs/provider.dart';
+import 'package:nfsee/data/nfc_manager.dart';
 import 'package:nfsee/models.dart';
 import 'package:nfsee/ui/home.dart';
 import 'package:nfsee/ui/scripts.dart';
@@ -39,8 +39,6 @@ class _NFSeeAppState extends State<NFSeeApp> {
   Widget build(context) {
     return BlocProvider(
       bloc: bloc,
-      // Either Material or Cupertino widgets work in either Material or Cupertino
-      // Apps.
       child: MaterialApp(
         debugShowCheckedModeBanner: false,
         localizationsDelegates: [
@@ -80,13 +78,6 @@ class _NFSeeAppState extends State<NFSeeApp> {
   }
 }
 
-// Shows a different type of scaffold depending on the platform.
-//
-// This file has the most amount of non-sharable code since it behaves the most
-// differently between the platforms.
-//
-// These differences are also subjective and have more than one 'right' answer
-// depending on the app and content.
 class PlatformAdaptingHomePage extends StatefulWidget {
   @override
   State<PlatformAdaptingHomePage> createState() =>
@@ -99,6 +90,7 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
   Exception? error;
   final GlobalKey<ScaffoldMessengerState> _scaffoldMessengerKey =
       GlobalKey<ScaffoldMessengerState>();
+  final NfcManager _nfcManager = NfcManager();
 
   PageController? topController;
   WebViewManager webview = WebViewManager();
@@ -125,8 +117,6 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
     topController = PageController(
       initialPage: currentTop,
     );
-    // Webview should reload when it's initialized. So we don't need to call reload here
-    // webview.reload();
   }
 
   @override
@@ -144,7 +134,7 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
   }
 
   void _onReceivedMessage(WebViewEvent ev) async {
-    if (ev.reload) return; // Main doesn't care about reload events
+    if (ev.reload) return;
     if (ev.message == null) return;
 
     try {
@@ -154,12 +144,12 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
         case 'poll':
           error = null;
           try {
-            final tag =
-                await FlutterNfcKit.poll(iosAlertMessage: S(context).waitForCard);
-            final json = tag.toJson();
+            final tag = await _nfcManager.pollForTag(
+                alertMessage: S(context).waitForCard);
+            final json = tag?.rawJson ?? {};
 
             try {
-              final ndef = await FlutterNfcKit.readNDEFRawRecords();
+              final ndef = await _nfcManager.readNdefRawRecords();
               json["ndef"] = ndef;
             } on Exception catch (e) {
               json["ndef"] = null;
@@ -167,7 +157,6 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
             }
 
             await webview.run("pollCallback(${jsonEncode(json)})");
-            FlutterNfcKit.setIosAlertMessage(S(context).cardPolled);
           } on Exception catch (e) {
             error = e;
             log('Poll error: $e');
@@ -181,10 +170,13 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
         case 'transceive':
           try {
             log('TX: ${scriptModel.data}');
-            final rapdu =
-                await FlutterNfcKit.transceive(scriptModel.data as String);
-            log('RX: $rapdu');
-            await webview.run("transceiveCallback('$rapdu')");
+            final res = await _nfcManager.transceiveApdu(scriptModel.data as String);
+            if (res.success) {
+              log('RX: ${res.responseApdu}');
+              await webview.run("transceiveCallback('${res.responseApdu}')");
+            } else {
+              throw Exception(res.errorMessage);
+            }
           } on Exception catch (e) {
             error = e;
             log('Transceive error: $e');
@@ -203,12 +195,11 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
 
         case 'finish':
           try {
-            if (error != null) {
-              await FlutterNfcKit.finish(iosErrorMessage: S(context).readFailed);
-              error = null;
-            } else {
-              await FlutterNfcKit.finish(iosAlertMessage: S(context).readSucceeded);
-            }
+            await _nfcManager.finishSession(
+              errorMessage: error != null ? S(context).readFailed : null,
+              alertMessage: error == null ? S(context).readSucceeded : null,
+            );
+            error = null;
           } catch (e) {
             log('Finish error caught: $e');
           }
@@ -304,7 +295,6 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
   }
 
   Future<bool> _readTag(BuildContext context) async {
-    // Because we are launching an modal bottom sheet, user should not be able to intereact with the app anymore
     assert(!_reading);
 
     _reading = true;
@@ -319,13 +309,11 @@ class _PlatformAdaptingHomePageState extends State<PlatformAdaptingHomePage> {
     }
 
     final script = await rootBundle.loadString('assets/read.js');
-    // Reload before read to ensure an clear state
     await webview.reload();
     await webview.run(script);
 
     bool cardRead = true;
     if ((await modal) != true) {
-      // closed by user, reject the promise
       await webview.run("pollErrorCallback('User cancelled operation')");
       cardRead = false;
     }
