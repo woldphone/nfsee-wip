@@ -86,6 +86,11 @@ class NfcManager {
     }
   }
 
+  Future<List<dynamic>?> readNdefRawRecords() async {
+    if (_state != NfcSessionState.connected) return null;
+    return await FlutterNfcKit.readNDEFRawRecords();
+  }
+
   Future<NfcOperationResult> transceiveApdu(String capduHex) async {
     if (_state != NfcSessionState.connected) {
       return NfcOperationResult.failure('No active NFC tag connected.');
